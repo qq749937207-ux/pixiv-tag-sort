@@ -1,0 +1,14 @@
+{
+  "name": "pixiv-tag-sort",
+  "version": "1.12.0",
+  "description": "Pixiv 标签热门排序用户脚本：按收藏数排序、范围过滤、结果页预览。",
+  "private": true,
+  "license": "MIT",
+  "scripts": {
+    "test": "node test16.js && node test17.js && node test18.js && node test19.js && node test15.js && node test9.js"
+  },
+  "devDependencies": {
+    "fake-indexeddb": "^6.2.5",
+    "jsdom": "^24.1.3"
+  }
+}
