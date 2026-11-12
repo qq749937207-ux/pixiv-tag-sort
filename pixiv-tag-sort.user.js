@@ -99,32 +99,95 @@
 
   /* ---------- cache (IndexedDB; never in localStorage) ---------- */
   try { Object.keys(localStorage).forEach(function (k) { if (/^pxsort_cache/.test(k)) localStorage.removeItem(k); }); } catch (e) { }
-  var cache = {}, dirty = {}, db = null;
-  function idb(fn) {
-    if (db) return fn(db);
-    try {
-      var rq = indexedDB.open('pxsort', 1);
+  var cache = {}, dirty = {}, cacheN = 0, db = null, dbp = null, busy = false, gen = 0, dropped = [], ready = false;
+  function idb() {
+    if (db) return Promise.resolve(db);
+    if (dbp) return dbp;
+    var p = new Promise(function (res, rej) {
+      var rq;
+      try { rq = indexedDB.open('pxsort', 1); }
+      catch (e) { rej(e); return; }
       rq.onupgradeneeded = function () { rq.result.createObjectStore('bm'); };
-      rq.onsuccess = function () { db = rq.result; fn(db); };
-      rq.onerror = function () { };
-    } catch (e) { }
+      rq.onsuccess = function () { db = rq.result; res(db); };
+      rq.onerror = function () { rej(rq.error || new Error('idb')); };
+    });
+    dbp = p;
+    p.then(function () { if (dbp === p) dbp = null; }, function () { if (dbp === p) dbp = null; });
+    return p;
   }
-  idb(function (d) {
+  idb().then(function (d) {
     try {
       var now = Date.now(), os = d.transaction('bm', 'readwrite').objectStore('bm'), cur = os.openCursor();
-      cur.onsuccess = function () { var c = cur.result; if (!c) return; if (now - c.value.t > TTL) c.delete(); else if (!cache[c.key]) cache[c.key] = c.value; c.continue(); };
-    } catch (e) { }
-  });
+      cur.onsuccess = function () {
+        var c = cur.result;
+        if (!c) { ready = true; cacheSave(); return; }
+        if (now - c.value.t > TTL) c.delete(); else if (!cache[c.key]) { cache[c.key] = c.value; cacheN++; }
+        c.continue();
+      };
+      cur.onerror = function () { ready = true; };
+    } catch (e) { ready = true; }
+  }, function () { ready = true; });
   function cacheGet(id) { var c = cache[id]; return c && Date.now() - c.t < TTL ? c : null; }
-  function cachePut(id, v) { v.t = Date.now(); cache[id] = v; dirty[id] = v; }
-  function cacheSave() {
-    var ks = Object.keys(dirty); if (!ks.length) return;
-    var batch = dirty; dirty = {};
-    idb(function (d) { try { var os = d.transaction('bm', 'readwrite').objectStore('bm'); ks.forEach(function (k) { os.put(batch[k], k); }); } catch (e) { } });
-    var all = Object.keys(cache);
-    if (all.length > CACHE_MAX) all.sort(function (a, b) { return cache[a].t - cache[b].t; }).slice(0, all.length - CACHE_MAX).forEach(function (k) { delete cache[k]; });
+  function cachePut(id, v) { v.t = Date.now(); if (!cache[id]) cacheN++; cache[id] = v; dirty[id] = v; }
+  // Once past CACHE_MAX, drop expired then oldest down to CACHE_MAX-1000 so a full sort is not repeated on every save.
+  function evictKeys() {
+    if (cacheN <= CACHE_MAX) return [];
+    var now = Date.now(), drop = [], fresh = [], keep = CACHE_MAX - 1000;
+    Object.keys(cache).forEach(function (k) {
+      var c = cache[k];
+      if (!c || now - c.t > TTL) drop.push(k); else fresh.push(k);
+    });
+    if (fresh.length > CACHE_MAX) {
+      fresh.sort(function (a, b) { return cache[a].t - cache[b].t; });
+      drop = drop.concat(fresh.splice(0, fresh.length - keep));
+    }
+    drop.forEach(function (k) { delete cache[k]; delete dirty[k]; });
+    cacheN = fresh.length;
+    return drop;
   }
-  function cacheClear() { cache = {}; dirty = {}; idb(function (d) { try { d.transaction('bm', 'readwrite').objectStore('bm').clear(); } catch (e) { } }); }
+  function cacheSave() {
+    if (busy) return;
+    busy = true;
+    var drop = ready ? evictKeys() : [], ks, batch = {}, del, snap;
+    if (drop.length) dropped = dropped.concat(drop);
+    dropped = dropped.filter(function (k) { return !cache[k]; });
+    ks = Object.keys(dirty);
+    ks.forEach(function (k) { batch[k] = dirty[k]; });
+    if (!ks.length && !dropped.length) { busy = false; return; }
+    del = dropped.slice(); snap = gen;
+    idb().then(function (d) {
+      if (snap !== gen) return false;
+      return new Promise(function (res, rej) {
+        var tx, done = false;
+        try { tx = d.transaction('bm', 'readwrite'); }
+        catch (e) { rej(e); return; }
+        try {
+          var os = tx.objectStore('bm');
+          ks.forEach(function (k) { if (dirty[k] === batch[k]) os.put(batch[k], k); });
+          del.forEach(function (k) { if (!cache[k]) os.delete(k); });
+        } catch (e) { if (!done) { done = true; try { tx.abort(); } catch (e2) {} rej(e); } return; }
+        tx.oncomplete = function () { if (!done) { done = true; res(true); } };
+        tx.onabort = function () { if (!done) { done = true; rej(tx.error || new Error('idb')); } };
+      });
+    }).then(function (ok) {
+      if (ok && snap === gen) {
+        ks.forEach(function (k) { if (dirty[k] === batch[k]) delete dirty[k]; });
+        var gone = {};
+        del.forEach(function (k) { if (!cache[k]) gone[k] = 1; });
+        dropped = dropped.filter(function (k) { return !gone[k]; });
+      }
+      busy = false;
+      if (ok && snap === gen && (Object.keys(dirty).length || dropped.length || (ready && cacheN > CACHE_MAX))) cacheSave();
+    }, function () { busy = false; });
+  }
+  function cacheClear() {
+    cache = {}; dirty = {}; cacheN = 0; dropped = []; gen++;
+    var snap = gen;
+    idb().then(function (d) {
+      if (snap !== gen) return;
+      try { d.transaction('bm', 'readwrite').objectStore('bm').clear(); } catch (e) {}
+    }, function () {});
+  }
   setInterval(cacheSave, 3000);
 
   function getTag() {
@@ -592,6 +655,7 @@
         doStop(''); showCooldown(); throw Aborted();
       }
       if (r.status >= 500) { await sleep(3000); continue; }
+      if (r.status < 200 || r.status >= 300) throw new Error('HTTP ' + r.status);
       var j; try { j = await r.json(); } catch (e) { await sleep(2000); continue; }
       if (j.error) throw new Error(j.message || '接口错误');
       return j.body;
